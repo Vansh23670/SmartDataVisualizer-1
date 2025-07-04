@@ -49,13 +49,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 CONFIG = {
-    "api_base_url": "https://api.binance.com",
+    "primary_api": "https://api.coinbase.com/v2",
+    "fallback_apis": [
+        "https://api.coingecko.com/api/v3",
+        "https://api.coinpaprika.com/v1"
+    ],
+    "binance_api": "https://api.binance.com",
     "ws_base_url": "wss://stream.binance.com:9443",
     "default_limit": 100,
     "default_interval": "1m",
     "supported_cryptos": ["BTC", "ETH", "XRP", "ADA", "SOL"],
-    "max_retries": 10,
-    "cache_ttl": 15,
+    "max_retries": 3,
+    "cache_ttl": 30,
     "valid_timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"],
 }
 
@@ -124,26 +129,50 @@ load_portfolio()
 # --------------------------
 
 async def fetch_historical_klines_async(symbol: str, interval: str = "1m", limit: int = 100) -> pd.DataFrame:
-    """Fetch historical kline data from Binance API with rate limiting."""
-    connector = aiohttp.TCPConnector(limit=10)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        url = f"{CONFIG['api_base_url']}/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            df = pd.DataFrame(
-                data,
-                columns=[
-                    "open_time", "open", "high", "low", "close", "volume",
-                    "close_time", "quote_asset_volume", "number_of_trades",
-                    "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore",
-                ],
-            )
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col])
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
-            return df
+    """Fetch historical kline data with fallback to alternative APIs."""
+    crypto_symbol = symbol.replace("USDT", "").upper()
+    
+    async with aiohttp.ClientSession() as session:
+        # Try CoinGecko for historical data
+        try:
+            coingecko_map = {
+                "BTC": "bitcoin",
+                "ETH": "ethereum",
+                "XRP": "ripple", 
+                "ADA": "cardano",
+                "SOL": "solana"
+            }
+            
+            if crypto_symbol in coingecko_map:
+                # Get basic historical data from CoinGecko (limited but free)
+                url = f"https://api.coingecko.com/api/v3/coins/{coingecko_map[crypto_symbol]}/market_chart?vs_currency=usd&days=1&interval=hourly"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        prices = data["prices"]
+                        volumes = data["total_volumes"]
+                        
+                        # Create a simplified DataFrame with available data
+                        df_data = []
+                        for i, (price_data, volume_data) in enumerate(zip(prices[-limit:], volumes[-limit:])):
+                            timestamp, price = price_data
+                            _, volume = volume_data
+                            df_data.append({
+                                "open_time": pd.to_datetime(timestamp, unit="ms"),
+                                "close_time": pd.to_datetime(timestamp, unit="ms"),
+                                "open": price,
+                                "high": price,  # Only actual price available from this API
+                                "low": price,   # Only actual price available from this API
+                                "close": price,
+                                "volume": volume
+                            })
+                        
+                        return pd.DataFrame(df_data)
+        except Exception as e:
+            logger.warning(f"CoinGecko historical data failed: {e}")
+        
+        # If historical data is not available, raise an exception
+        raise Exception(f"Historical data not available for {symbol}. Please configure a cryptocurrency API with historical data access.")
 
 async def fetch_all_historical_data(symbols: list, interval: str = "1d", limit: int = 30) -> dict:
     """Fetch historical data for multiple symbols concurrently."""
@@ -152,27 +181,82 @@ async def fetch_all_historical_data(symbols: list, interval: str = "1d", limit: 
     return {symbol: result for symbol, result in zip(symbols, results) if not isinstance(result, Exception)}
 
 async def fetch_current_price_async(symbol: str) -> float:
-    """Fetch current price from Binance API with caching."""
+    """Fetch current price from multiple APIs with fallback."""
     cache_key = f"{symbol}_price"
     if cache_key in price_cache and (time.time() - price_cache[cache_key]["timestamp"]) < CONFIG["cache_ttl"]:
         return price_cache[cache_key]["price"]
-    connector = aiohttp.TCPConnector(limit=10)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        url = f"{CONFIG['api_base_url']}/api/v3/ticker/price?symbol={symbol.upper()}"
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            price_data = await resp.json()
-            price = float(price_data["price"])
-            price_cache[cache_key] = {"price": price, "timestamp": time.time()}
-            return price
+    
+    # Convert symbol format for different APIs
+    crypto_symbol = symbol.replace("USDT", "").upper()
+    
+    async with aiohttp.ClientSession() as session:
+        # Try CoinGecko API first (free and reliable)
+        try:
+            coingecko_map = {
+                "BTC": "bitcoin",
+                "ETH": "ethereum", 
+                "XRP": "ripple",
+                "ADA": "cardano",
+                "SOL": "solana"
+            }
+            if crypto_symbol in coingecko_map:
+                url = f"https://api.coingecko.com/api/v3/simple/price?ids={coingecko_map[crypto_symbol]}&vs_currencies=usd"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = float(data[coingecko_map[crypto_symbol]]["usd"])
+                        price_cache[cache_key] = {"price": price, "timestamp": time.time()}
+                        return price
+        except Exception as e:
+            logger.warning(f"CoinGecko API failed: {e}")
+        
+        # Try Coinbase API as fallback
+        try:
+            coinbase_map = {
+                "BTC": "BTC-USD",
+                "ETH": "ETH-USD",
+                "XRP": "XRP-USD", 
+                "ADA": "ADA-USD",
+                "SOL": "SOL-USD"
+            }
+            if crypto_symbol in coinbase_map:
+                url = f"https://api.coinbase.com/v2/exchange-rates?currency={crypto_symbol}"
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = float(data["data"]["rates"]["USD"])
+                        price_cache[cache_key] = {"price": price, "timestamp": time.time()}
+                        return price
+        except Exception as e:
+            logger.warning(f"Coinbase API failed: {e}")
+        
+        # If all APIs fail, raise an exception to indicate no data available
+        raise Exception("Unable to fetch price data from any available API")
 
 @st.cache_data(ttl=10)
 def fetch_order_book(symbol: str, limit: int = 100):
     """Fetch order book bids and asks for depth chart."""
-    url = f"{CONFIG['api_base_url']}/api/v3/depth?symbol={symbol}&limit={limit}"
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()
+    try:
+        # Try Binance API first
+        url = f"{CONFIG['binance_api']}/api/v3/depth?symbol={symbol}&limit={limit}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 451:
+            # Geographic restriction - return empty state
+            return {
+                "status": "Order book data unavailable",
+                "message": "Order book data is restricted in this region. Please configure alternative exchange APIs.",
+                "bids": [],
+                "asks": []
+            }
+    except Exception as e:
+        return {
+            "status": "Error fetching order book",
+            "message": f"Failed to connect to exchange APIs: {str(e)}",
+            "bids": [],
+            "asks": []
+        }
 
 @st.cache_data(ttl=60)
 def fetch_dex_data(crypto: str) -> dict:
