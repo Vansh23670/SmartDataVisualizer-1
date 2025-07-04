@@ -1,0 +1,1337 @@
+import streamlit as st
+import requests
+import aiohttp
+import asyncio
+import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
+import json
+import time
+import threading
+from queue import Queue
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sklearn.neural_network import MLPRegressor
+from sklearn.inspection import permutation_importance
+from scipy.optimize import minimize
+from datetime import datetime
+from websocket import create_connection, WebSocketConnectionClosedException
+import os
+import logging
+from cryptography.fernet import Fernet
+import ast
+import nest_asyncio
+from functools import wraps
+from plotly.subplots import make_subplots
+
+# External library for sortable widgets
+try:
+    from streamlit_sortables import sortables
+except ImportError:
+    st.warning("⚠️ Optional dependency 'streamlit-sortables' missing. Install with 'pip install streamlit-sortables' to enable dashboard customization.")
+    sortables = None
+
+nest_asyncio.apply()
+
+try:
+    import pandas_ta as ta
+except ImportError as e:
+    ta = None
+    if "cannot import name 'NaN'" in str(e):
+        st.error("⚠️ Failed to import pandas_ta due to NumPy compatibility. Using limited indicators.")
+    else:
+        st.error("⚠️ Failed to import pandas_ta: limited indicators enabled.")
+
+df_live = None
+current_price = None
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+CONFIG = {
+    "api_base_url": "https://api.binance.com",
+    "ws_base_url": "wss://stream.binance.com:9443",
+    "default_limit": 100,
+    "default_interval": "1m",
+    "supported_cryptos": ["BTC", "ETH", "XRP", "ADA", "SOL"],
+    "max_retries": 10,
+    "cache_ttl": 15,
+    "valid_timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"],
+}
+
+PORTFOLIO_KEY_FILE = "portfolio_key.bin"
+if 'encryption_key' not in st.session_state:
+    if os.path.exists(PORTFOLIO_KEY_FILE):
+        with open(PORTFOLIO_KEY_FILE, 'rb') as f:
+            st.session_state.encryption_key = f.read()
+    else:
+        st.session_state.encryption_key = Fernet.generate_key()
+        with open(PORTFOLIO_KEY_FILE, 'wb') as f:
+            f.write(st.session_state.encryption_key)
+cipher = Fernet(st.session_state.encryption_key)
+
+price_cache = {}
+
+if "pandas_ta_missing" not in st.session_state:
+    st.session_state.pandas_ta_missing = ta is None
+    if ta is None:
+        st.warning("⚠️ Technical indicators disabled due to missing pandas_ta. Basic SMA/RSI shown.")
+
+if "portfolio" not in st.session_state:
+    st.session_state.portfolio = {crypto: 0 for crypto in CONFIG["supported_cryptos"]}
+
+if 'ws_thread_running' not in st.session_state:
+    st.session_state.ws_thread_running = False
+if 'ws_data' not in st.session_state:
+    st.session_state.ws_data = None
+if 'ws_queue' not in st.session_state:
+    st.session_state.ws_queue = Queue()
+if 'ws_symbol' not in st.session_state:
+    st.session_state.ws_symbol = None
+if 'ws_errors' not in st.session_state:
+    st.session_state.ws_errors = []
+if 'last_update' not in st.session_state:
+    st.session_state.last_update = 0
+if 'timeframe' not in st.session_state:
+    st.session_state.timeframe = CONFIG["default_interval"]
+if 'crypto' not in st.session_state:
+    st.session_state.crypto = CONFIG["supported_cryptos"][0]
+
+PORTFOLIO_FILE = "portfolio.json"
+
+def save_portfolio() -> None:
+    encrypted_data = cipher.encrypt(json.dumps(st.session_state.portfolio).encode())
+    with open(PORTFOLIO_FILE, 'wb') as f:
+        f.write(encrypted_data)
+
+def load_portfolio() -> None:
+    if os.path.exists(PORTFOLIO_FILE):
+        try:
+            with open(PORTFOLIO_FILE, 'rb') as f:
+                encrypted_data = f.read()
+            decrypted_data = cipher.decrypt(encrypted_data).decode()
+            st.session_state.portfolio = json.loads(decrypted_data)
+        except Exception as e:
+            st.error(f"Failed to load portfolio: {e}")
+            st.session_state.portfolio = {crypto: 0 for crypto in CONFIG["supported_cryptos"]}
+    else:
+        st.session_state.portfolio = {crypto: 0 for crypto in CONFIG["supported_cryptos"]}
+
+load_portfolio()
+
+if not hasattr(st, "runtime"):
+    st.warning("⚠️ Please run this script with 'streamlit run integrated_crypto_dashboard.py' for full functionality.")
+    exit()
+
+# --------------------------
+# API Fetching Functions with async
+# --------------------------
+
+async def fetch_historical_klines_async(symbol: str, interval: str = "1m", limit: int = 100) -> pd.DataFrame:
+    """Fetch historical kline data from Binance API with rate limiting."""
+    connector = aiohttp.TCPConnector(limit=10)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        url = f"{CONFIG['api_base_url']}/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            df = pd.DataFrame(
+                data,
+                columns=[
+                    "open_time", "open", "high", "low", "close", "volume",
+                    "close_time", "quote_asset_volume", "number_of_trades",
+                    "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore",
+                ],
+            )
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col])
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+            return df
+
+async def fetch_all_historical_data(symbols: list, interval: str = "1d", limit: int = 30) -> dict:
+    """Fetch historical data for multiple symbols concurrently."""
+    tasks = [fetch_historical_klines_async(symbol + "USDT", interval, limit) for symbol in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return {symbol: result for symbol, result in zip(symbols, results) if not isinstance(result, Exception)}
+
+async def fetch_current_price_async(symbol: str) -> float:
+    """Fetch current price from Binance API with caching."""
+    cache_key = f"{symbol}_price"
+    if cache_key in price_cache and (time.time() - price_cache[cache_key]["timestamp"]) < CONFIG["cache_ttl"]:
+        return price_cache[cache_key]["price"]
+    connector = aiohttp.TCPConnector(limit=10)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        url = f"{CONFIG['api_base_url']}/api/v3/ticker/price?symbol={symbol.upper()}"
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            price_data = await resp.json()
+            price = float(price_data["price"])
+            price_cache[cache_key] = {"price": price, "timestamp": time.time()}
+            return price
+
+@st.cache_data(ttl=10)
+def fetch_order_book(symbol: str, limit: int = 100):
+    """Fetch order book bids and asks for depth chart."""
+    url = f"{CONFIG['api_base_url']}/api/v3/depth?symbol={symbol}&limit={limit}"
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+@st.cache_data(ttl=60)
+def fetch_dex_data(crypto: str) -> dict:
+    """Fetch simulated DEX data with detailed metrics."""
+    return {
+        "liquidity": f"{crypto} Liquidity: $1.2M",
+        "volume_24h": f"Volume (24h): $500K",
+        "pool_count": 5
+    }
+
+@st.cache_data(ttl=60)
+def fetch_wallet_balance(crypto: str) -> dict:
+    """Fetch simulated wallet balance with additional details."""
+    price_lookup = {"BTC": 30000, "ETH": 2000, "XRP": 0.5, "ADA": 0.3, "SOL": 20}
+    price = price_lookup.get(crypto, 0)
+    amount = 10.5
+    return {
+        f"{crypto}_balance": f"{crypto} Balance: {amount} units",
+        "usd_value": f"USD Value: ${amount * price:.2f}",
+        "locked_funds": "Locked: 2.0 units"
+    }
+
+@st.cache_data(ttl=300)
+def fetch_ico_data() -> list:
+    """Fetch simulated ICO data with more details."""
+    return [
+        {"name": "ICO1", "date": "Launching Jul 10, 2025", "raised": "$1.5M"},
+        {"name": "ICO2", "date": "Pre-sale ongoing", "raised": "$0.8M"}
+    ]
+
+@st.cache_data(ttl=30)
+def fetch_exchange_prices(crypto: str) -> dict:
+    """Fetch simulated exchange prices with more exchanges."""
+    base = 30000 if crypto == "BTC" else 2000 if crypto == "ETH" else 0.5
+    return {
+        f"{crypto}USDT": {
+            "Binance": base,
+            "Coinbase": base * 1.001,
+            "Kraken": base * 0.995,
+            "Bitfinex": base * 1.002,
+            "Gemini": base * 0.998
+        }
+    }
+
+@st.cache_data(ttl=30)
+def fetch_transaction_data(crypto: str) -> dict:
+    """Fetch simulated transaction data with additional metrics."""
+    return {
+        "tx_count": 150,
+        "volume": 50000,
+        "avg_tx_value": 333.33,
+        "pending_txs": 5
+    }
+
+# --------------------------
+# Sentiment Analysis with X
+# --------------------------
+
+@st.cache_data(ttl=60)
+def fetch_x_posts(query: str, limit: int = 10) -> list:
+    """Fetch X posts for sentiment analysis."""
+    return [{"text": f"Sample post about {query} #{query}"} for _ in range(limit)]
+
+@st.cache_resource
+def get_sentiment_analyzer():
+    """Cached SentimentIntensityAnalyzer instance."""
+    return SentimentIntensityAnalyzer()
+
+@st.cache_data(ttl=60)
+def analyze_sentiment(crypto: str) -> dict:
+    """Analyze sentiment of X posts for a cryptocurrency with detailed scores."""
+    analyzer = get_sentiment_analyzer()
+    posts = fetch_x_posts(f"{crypto} price")
+    sentiments = [analyzer.polarity_scores(post["text"]) for post in posts]
+    if sentiments:
+        avg_sentiment = {"compound": np.mean([s["compound"] for s in sentiments]),
+                         "positive": np.mean([s["pos"] for s in sentiments]),
+                         "negative": np.mean([s["neg"] for s in sentiments]),
+                         "neutral": np.mean([s["neu"] for s in sentiments])}
+        return avg_sentiment
+    return {"compound": 0.0, "positive": 0.0, "negative": 0.0, "neutral": 0.0}
+
+# --------------------------
+# Indicator Calculation & Chart
+# --------------------------
+
+def calculate_sma_fallback(df: pd.DataFrame, length: int) -> pd.Series:
+    """Calculate Simple Moving Average as a fallback."""
+    return df["close"].rolling(window=length).mean()
+
+def calculate_rsi_fallback(df: pd.DataFrame, length: int) -> pd.Series:
+    """Calculate RSI as a fallback when pandas_ta is unavailable."""
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=length).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=length).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_indicators(df: pd.DataFrame, sma_length: int, rsi_length: int, macd_fast: int, macd_slow: int, macd_signal: int, theme: str = "plotly") -> go.Figure:
+    """Calculate technical indicators and generate a Plotly chart with Bollinger Bands."""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+                        subplot_titles=("Price with SMA & Bollinger Bands", "RSI & MACD"))
+    fig.add_trace(go.Scatter(x=df["close_time"], y=df["close"], mode="lines", name="Close Price"), row=1, col=1)
+    if ta is not None:
+        try:
+            df["SMA"] = ta.sma(df["close"], length=sma_length)
+            fig.add_trace(go.Scatter(x=df["close_time"], y=df["SMA"], mode="lines", name=f"SMA({sma_length})"), row=1, col=1)
+            
+            bbands = ta.bbands(df["close"], length=sma_length, std=2)
+            upper_band_col = next((col for col in bbands.columns if col.startswith("BBU")), None)
+            lower_band_col = next((col for col in bbands.columns if col.startswith("BBL")), None)
+
+            if upper_band_col and lower_band_col:
+                fig.add_trace(go.Scatter(x=df["close_time"], y=bbands[upper_band_col], mode="lines", name="Upper BB"), row=1, col=1)
+                fig.add_trace(go.Scatter(x=df["close_time"], y=bbands[lower_band_col], mode="lines", name="Lower BB", fill="tonexty"), row=1, col=1)
+            else:
+                st.warning("Bollinger Bands columns not found, skipping BB plot.")
+
+            rsi = ta.rsi(df["close"], length=rsi_length)
+            fig.add_trace(go.Scatter(x=df["close_time"], y=rsi, mode="lines", name=f"RSI({rsi_length})"), row=2, col=1)
+            macd_df = ta.macd(df["close"], fast=macd_fast, slow=macd_slow, signal=macd_signal)
+            fig.add_trace(go.Scatter(x=df["close_time"], y=macd_df["MACD_12_26_9"], mode="lines", name="MACD"), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df["close_time"], y=macd_df["MACDs_12_26_9"], mode="lines", name="MACD Signal"), row=2, col=1)
+        except Exception as e:
+            st.warning(f"Failed to calculate indicators: {e}. Using fallback.")
+            df["SMA"] = calculate_sma_fallback(df, sma_length)
+            df["RSI"] = calculate_rsi_fallback(df, rsi_length)
+            fig.add_trace(go.Scatter(x=df["close_time"], y=df["SMA"], mode="lines", name=f"SMA({sma_length})"), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df["close_time"], y=df["RSI"], mode="lines", name=f"RSI({rsi_length})"), row=2, col=1)
+    
+    else:
+        df["SMA"] = calculate_sma_fallback(df, sma_length)
+        df["RSI"] = calculate_rsi_fallback(df, rsi_length)
+        fig.add_trace(go.Scatter(x=df["close_time"], y=df["SMA"], mode="lines", name=f"SMA({sma_length})"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["close_time"], y=df["RSI"], mode="lines", name=f"RSI({rsi_length})"), row=2, col=1)
+    fig.update_layout(
+        title="Advanced Price Chart with Indicators",
+        xaxis_title="Time",
+        yaxis_title="Price (USDT)",
+        yaxis2_title="RSI/MACD",
+        height=800,
+        template=theme,
+        showlegend=True,
+        hovermode="x unified",
+        dragmode="zoom",
+        xaxis_rangeslider_visible=True,
+    )
+    return fig
+
+def calculate_rsi(df: pd.DataFrame, length: int) -> str:
+    """Calculate Relative Strength Index with overbought/oversold status."""
+    if ta is None:
+        try:
+            rsi_series = calculate_rsi_fallback(df, length)
+            if rsi_series.isna().all():
+                return "RSI: Not Available"
+            rsi_value = rsi_series.iloc[-1]
+            status = "Overbought" if rsi_value > 70 else "Oversold" if rsi_value < 30 else "Neutral"
+            return f"RSI({length}): {rsi_value:.2f} ({status})"
+        except Exception as e:
+            return f"RSI: Error calculating ({e})"
+    try:
+        rsi_series = ta.rsi(df["close"], length=length)
+        if rsi_series.isna().all():
+            return "RSI: Not Available"
+        rsi_value = rsi_series.iloc[-1]
+        status = "Overbought" if rsi_value > 70 else "Oversold" if rsi_value < 30 else "Neutral"
+        return f"RSI({length}): {rsi_value:.2f} ({status})"
+    except Exception as e:
+        return f"RSI: Error calculating ({e})"
+
+def calculate_macd(df: pd.DataFrame, fast: int, slow: int, signal: int) -> str:
+    """Calculate MACD indicator with crossover signal."""
+    if ta is None:
+        return "MACD: N/A (pandas_ta import failed)"
+    try:
+        macd_df = ta.macd(df["close"], fast=fast, slow=slow, signal=signal)
+        if macd_df["MACD_12_26_9"].isna().all():
+            return "MACD: Not Available"
+        macd = macd_df["MACD_12_26_9"].iloc[-1]
+        signal_line = macd_df["MACDs_12_26_9"].iloc[-1]
+        prev_macd = macd_df["MACD_12_26_9"].iloc[-2]
+        prev_signal = macd_df["MACDs_12_26_9"].iloc[-2]
+        crossover = "Bullish" if macd > signal_line and prev_macd <= prev_signal else "Bearish" if macd < signal_line and prev_macd >= prev_signal else "No Crossover"
+        return f"MACD: {macd:.2f}, Signal: {signal_line:.2f} ({crossover})"
+    except Exception as e:
+        return f"MACD: Error calculating ({e})"
+
+def fibonacci_retracements(df):
+    max_price = df["close"].max()
+    min_price = df["close"].min()
+    diff = max_price - min_price
+    levels = {
+        "0%": max_price,
+        "23.6%": max_price - 0.236 * diff,
+        "38.2%": max_price - 0.382 * diff,
+        "50%": max_price - 0.5 * diff,
+        "61.8%": max_price - 0.618 * diff,
+        "100%": min_price,
+    }
+    return levels
+
+def plot_with_fibonacci(df):
+    fib_levels = fibonacci_retracements(df)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df['close_time'], y=df['close'], name="Price"))
+    for lvl, price in fib_levels.items():
+        fig.add_hline(y=price, line_dash="dash", annotation_text=f"Fib {lvl}: {price:.2f}", annotation_position="right")
+    st.plotly_chart(fig, use_container_width=True)
+
+# --------------------------
+# Machine Learning Price Prediction
+# --------------------------
+
+def predict_price(df: pd.DataFrame, sentiment: float, indicators: dict) -> tuple[float, float, object, np.ndarray, np.ndarray]:
+    if len(df) < 3:
+        return df["close"].iloc[-1], 0.0, None, None, None
+    X = np.array([[i, sentiment, df["close"].iloc[i], indicators.get("SMA", df["close"].iloc[i])] for i in range(len(df) - 2)])
+    y = df["close"].iloc[2:].to_numpy()
+    model = MLPRegressor(hidden_layer_sizes=(50, 50), max_iter=1000, random_state=42)
+    try:
+        model.fit(X, y)
+        pred_x = np.array([[len(df), sentiment, df["close"].iloc[-1], indicators.get("SMA", df["close"].iloc[-1])]])
+        prediction = model.predict(pred_x)[0]
+        residuals = y - model.predict(X)
+        std_dev = np.std(residuals)
+        conf_interval = 1.96 * std_dev / np.sqrt(len(X))
+        return prediction, conf_interval, model, X, y
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        return df["close"].iloc[-1], 0.0, None, None, None
+
+def plot_feature_importance(model, X, y):
+    if model is None or X is None or y is None:
+        return
+    result = permutation_importance(model, X, y, n_repeats=10, random_state=42)
+    importances = pd.Series(result.importances_mean, index=['timestep', 'sentiment', 'close', 'SMA'])
+    st.subheader("Feature Importance")
+    st.bar_chart(importances.sort_values(ascending=True))
+
+# --------------------------
+# Backtesting with Visualization
+# --------------------------
+
+def timeout(seconds):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            result = [None]
+            def target():
+                try:
+                    result[0] = func(*args, **kwargs)
+                except Exception as e:
+                    result[0] = f"Error: {e}"
+            t = threading.Thread(target=target)
+            t.start()
+            t.join(seconds)
+            if t.is_alive():
+                return "Backtest timed out"
+            return result[0]
+        return wrapper
+    return decorator
+
+def validate_strategy_ast(source_code: str) -> tuple[bool, str]:
+    try:
+        tree = ast.parse(source_code)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                return False, "Imports are not allowed in strategy file"
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in ["eval", "exec", "open", "os", "sys"]:
+                    return False, f"Function {node.func.id} is not allowed"
+        return True, ""
+    except SyntaxError as e:
+        return False, f"Invalid Python syntax: {e}"
+    except Exception as e:
+        return False, f"AST validation failed: {e}"
+
+@timeout(5)
+def backtest_strategy(strategy_file, df: pd.DataFrame, start_date: datetime = None, end_date: datetime = None) -> dict:
+    try:
+        if start_date and end_date:
+            mask = (df["close_time"] >= pd.to_datetime(start_date)) & (df["close_time"] <= pd.to_datetime(end_date))
+            df = df.loc[mask].copy()
+        if df.empty:
+            return "Backtest failed: No data available for the selected date range."
+        source_code = strategy_file.read().decode()
+        is_valid, error_msg = validate_strategy_ast(source_code)
+        if not is_valid:
+            return f"Validation failed: {error_msg}"
+        code = compile(source_code, '<string>', 'exec')
+        local_vars = {}
+        allowed_builtins = ["len", "range", "min", "max", "sum", "abs", "float", "int", "print"]
+        restricted_globals = {"df": df.copy(), "__builtins__": {k: __builtins__[k] for k in allowed_builtins}, "pd": pd, "np": np}
+        exec(code, restricted_globals, local_vars)
+        if "strategy" not in local_vars:
+            return "Error: Uploaded file must define a function named 'strategy(df)'"
+        result = local_vars["strategy"](df)
+        if not isinstance(result, dict) or "signals" not in result or "returns" not in result:
+            return "Error: Strategy must return a dict with 'signals' and 'returns'"
+        equity = (1 + result["returns"]).cumprod()
+        drawdown = 1 - equity / equity.cummax()
+        max_drawdown = drawdown.max()
+        sharpe_ratio = np.sqrt(252) * np.mean(result["returns"]) / np.std(result["returns"]) if np.std(result["returns"]) > 0 else 0.0
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+                            subplot_titles=("Equity Curve", "Drawdown"))
+        fig.add_trace(go.Scatter(x=df["close_time"], y=equity, mode="lines", name="Equity"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["close_time"], y=drawdown, mode="lines", name="Drawdown", fill="tozeroy"), row=2, col=1)
+        fig.update_layout(
+            title="Backtest Results",
+            height=600,
+            showlegend=True,
+            hovermode="x unified",
+            xaxis_rangeslider_visible=True,
+        )
+        return {
+            "result": f"Total Return: {equity.iloc[-1] - 1:.2%}, Max Drawdown: {max_drawdown:.2%}, Sharpe Ratio: {sharpe_ratio:.2f}",
+            "fig": fig
+        }
+    except Exception as e:
+        return f"Backtest failed: {e}"
+
+# --------------------------
+# Risk Management
+# --------------------------
+
+def calculate_var(df: pd.DataFrame, confidence_level: float = 0.95) -> float:
+    df = df.copy()
+    df["returns"] = df["close"].pct_change()
+    var_pct = np.percentile(df["returns"].dropna(), (1 - confidence_level) * 100)
+    var = var_pct * df["close"].iloc[-1]
+    return var
+
+def calculate_sharpe_ratio(returns: pd.Series, risk_free_rate: float = 0.02) -> tuple[float, float]:
+    excess_returns = returns - risk_free_rate / 252
+    downside_returns = excess_returns[excess_returns < 0]
+    sharpe = np.mean(excess_returns) / np.std(excess_returns) * np.sqrt(252) if np.std(excess_returns) != 0 else 0.0
+    sortino = np.mean(excess_returns) / np.std(downside_returns) * np.sqrt(252) if len(downside_returns) > 0 and np.std(downside_returns) != 0 else 0.0
+    return sharpe, sortino
+
+# --------------------------
+# Portfolio Optimization
+# --------------------------
+
+def optimize_portfolio(weights: np.ndarray, returns: np.ndarray, cov_matrix: np.ndarray) -> float:
+    portfolio_risk = np.sqrt(weights.T @ cov_matrix @ weights)
+    return portfolio_risk
+
+def get_optimal_weights(df_dict: dict, target_return: float = 0.1) -> tuple:
+    assets = list(df_dict.keys())
+    returns = np.array([df["close"].pct_change().mean() * 252 for df in df_dict.values()])
+    cov_matrix = np.cov([df["close"].pct_change().dropna() * np.sqrt(252) for df in df_dict.values()])
+    n_assets = len(assets)
+    initial_weights = np.array([1.0 / n_assets] * n_assets)
+    bounds = tuple((0, 1) for _ in range(n_assets))
+    constraints = [
+        {"type": "eq", "fun": lambda w: np.sum(w) - 1},
+        {"type": "eq", "fun": lambda w: np.sum(w * returns) - target_return}
+    ]
+    result = minimize(
+        optimize_portfolio,
+        initial_weights,
+        args=(returns, cov_matrix),
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+    )
+    return result.x, assets
+
+# --------------------------
+# Portfolio Management
+# --------------------------
+
+def update_portfolio(crypto: str, amount: float = 1.0) -> dict:
+    if amount < 0:
+        st.error("Amount must be non-negative.")
+        return st.session_state.portfolio
+    st.session_state.portfolio[crypto] += amount
+    if 'transaction_history' not in st.session_state:
+        st.session_state.transaction_history = []
+    st.session_state.transaction_history.append({
+        "crypto": crypto,
+        "amount": amount,
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
+    save_portfolio()
+    return st.session_state.portfolio
+
+async def calculate_portfolio_value() -> tuple[float, dict]:
+    total_value = 0
+    allocations = {}
+    for crypto, amount in st.session_state.portfolio.items():
+        if amount > 0:
+            price = await fetch_current_price_async(crypto + "USDT")
+            value = amount * price
+            total_value += value
+            allocations[crypto] = value
+    return total_value, allocations
+
+# --------------------------
+# Market Status
+# --------------------------
+
+def get_market_status() -> dict:
+    utc_hour = (datetime.utcnow().hour + 5) % 24
+    status = "Market Active (High Volume)" if 9 <= utc_hour < 17 else "Market Low Volume (Off-Peak)"
+    volatility = np.std(df_live["close"].pct_change().dropna()) * np.sqrt(252) if 'df_live' in globals() and not df_live.empty else 0.15
+    return {"status": status, "volatility": volatility}
+
+# --------------------------
+# Binance WebSocket Integration
+# --------------------------
+
+def websocket_worker(symbol: str) -> None:
+    ws_url = f"{CONFIG['ws_base_url']}/ws/{symbol.lower()}usdt@kline_{st.session_state.get('timeframe', '1m')}"
+    retries = 0
+    while st.session_state.ws_thread_running and st.session_state.ws_symbol == symbol and retries < CONFIG["max_retries"]:
+        try:
+            ws = create_connection(ws_url)
+            ws.settimeout(1.0)
+            retries = 0
+            last_update = 0
+            while st.session_state.ws_thread_running and st.session_state.ws_symbol == symbol:
+                try:
+                    msg = ws.recv()
+                    current_time = time.time()
+                    if current_time - last_update >= 1:
+                        data = json.loads(msg)
+                        kline = data.get("k", {})
+                        if kline.get("t") and kline.get("x"):
+                            candle_data = {
+                                "open_time": pd.to_datetime(kline["t"], unit="ms"),
+                                "open": float(kline["o"]),
+                                "high": float(kline["h"]),
+                                "low": float(kline["l"]),
+                                "close": float(kline["c"]),
+                                "volume": float(kline["v"]),
+                                "close_time": pd.to_datetime(kline["T"], unit="ms"),
+                            }
+                            st.session_state.ws_queue.put(candle_data)
+                            last_update = current_time
+                except TimeoutError:
+                    continue
+                except WebSocketConnectionClosedException:
+                    st.session_state.ws_errors.append(f"WebSocket disconnected at {datetime.now()}")
+                    break
+                except Exception as e:
+                    st.session_state.ws_errors.append(f"WebSocket error at {datetime.now()}: {e}")
+                    time.sleep(1)
+            ws.close()
+        except Exception as e:
+            retries += 1
+            st.session_state.ws_errors.append(f"WebSocket connection failed at {datetime.now()}: {e}")
+            time.sleep(min(2 ** retries, 60))
+    if retries >= CONFIG["max_retries"]:
+        st.session_state.ws_errors.append(f"Max retries reached for {symbol} WebSocket")
+        st.error("WebSocket connection failed permanently. Please check your network.")
+
+def start_ws(symbol: str) -> None:
+    if st.session_state.ws_thread_running and st.session_state.ws_symbol == symbol:
+        return
+    if st.session_state.ws_thread_running:
+        st.session_state.ws_thread_running = False
+        time.sleep(1)
+    st.session_state.ws_thread_running = True
+    st.session_state.ws_symbol = symbol
+    t = threading.Thread(target=websocket_worker, args=(symbol,), daemon=True)
+    t.start()
+
+def get_updated_df(historical_df: pd.DataFrame) -> pd.DataFrame:
+    df = historical_df.copy() if historical_df is not None else None
+    if df is not None and not st.session_state.ws_queue.empty():
+        new_rows = []
+        while not st.session_state.ws_queue.empty():
+            candle_data = st.session_state.ws_queue.get()
+            last_ot = df["open_time"].iloc[-1]
+            ws_ot = candle_data["open_time"]
+            new_row = {
+                "open_time": ws_ot,
+                "open": candle_data["open"],
+                "high": candle_data["high"],
+                "low": candle_data["low"],
+                "close": candle_data["close"],
+                "volume": candle_data["volume"],
+                "close_time": candle_data["close_time"],
+                "quote_asset_volume": np.nan,
+                "number_of_trades": np.nan,
+                "taker_buy_base_asset_volume": np.nan,
+                "taker_buy_quote_asset_volume": np.nan,
+                "ignore": np.nan,
+            }
+            if ws_ot > last_ot:
+                new_rows.append(new_row)
+            elif ws_ot == last_ot:
+                df.at[df.index[-1], "open"] = candle_data["open"]
+                df.at[df.index[-1], "high"] = candle_data["high"]
+                df.at[df.index[-1], "low"] = candle_data["low"]
+                df.at[df.index[-1], "close"] = candle_data["close"]
+                df.at[df.index[-1], "volume"] = candle_data["volume"]
+                df.at[df.index[-1], "close_time"] = candle_data["close_time"]
+        if new_rows:
+            df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    return df
+
+# --------------------------
+# Depth Chart Visualization
+# --------------------------
+
+def plot_depth_chart(order_book):
+    bids = order_book['bids']
+    asks = order_book['asks']
+
+    bid_prices = np.array([float(bid[0]) for bid in bids])
+    bid_volumes = np.array([float(bid[1]) for bid in bids])
+    ask_prices = np.array([float(ask[0]) for ask in asks])
+    ask_volumes = np.array([float(ask[1]) for ask in asks])
+
+    bid_vol_cumulative = np.cumsum(bid_volumes[::-1])[::-1]
+    ask_vol_cumulative = np.cumsum(ask_volumes)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bid_prices, y=bid_vol_cumulative, mode='lines', name='Bids', line=dict(color='green')))
+    fig.add_trace(go.Scatter(x=ask_prices, y=ask_vol_cumulative, mode='lines', name='Asks', line=dict(color='red')))
+    fig.update_layout(title="Order Book Depth Chart", xaxis_title="Price (USDT)", yaxis_title="Cumulative Volume")
+    st.plotly_chart(fig, use_container_width=True)
+
+# --------------------------
+# Advanced Portfolio Analytics
+# --------------------------
+
+def plot_portfolio_analytics(df_dict: dict):
+    returns = {crypto: df['close'].pct_change().dropna() for crypto, df in df_dict.items()}
+    mean_returns = {k: v.mean() * 252 for k, v in returns.items()}
+    volatilities = {k: v.std() * np.sqrt(252) for k, v in returns.items()}
+
+    st.subheader("Portfolio Returns & Volatility")
+    df_stats = pd.DataFrame({'Annualized Return': mean_returns, 'Annualized Volatility': volatilities})
+    st.dataframe(df_stats)
+
+    st.subheader("Portfolio Asset Allocation")
+    allocation = pd.Series(st.session_state.portfolio)
+    allocation = allocation[allocation > 0]
+    if not allocation.empty:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots()
+        allocation.plot.pie(autopct='%1.1f%%', ax=ax, textprops={'fontsize': 12})
+        ax.set_ylabel('')
+        st.pyplot(fig)
+    else:
+        st.info("Portfolio is empty.")
+
+    st.subheader("Portfolio Drawdown")
+    weighted_returns = None
+    for crypto, amount in st.session_state.portfolio.items():
+        if crypto in returns and amount > 0:
+            weighted = returns[crypto] * amount
+            weighted_returns = weighted if weighted_returns is None else weighted_returns.add(weighted, fill_value=0)
+    if weighted_returns is not None:
+        equity = (1 + weighted_returns).cumprod()
+        rolling_max = equity.cummax()
+        drawdown = (equity - rolling_max) / rolling_max
+        st.line_chart(drawdown)
+    else:
+        st.info("Insufficient data for portfolio drawdown.")
+
+# --------------------------
+# On-Chain Data Analysis & Visualization (Simulated)
+# --------------------------
+
+@st.cache_data(ttl=600)
+def fetch_onchain_metrics(crypto: str) -> dict:
+    return {
+        "Active Addresses": 125000,
+        "Tx Volume (24h)": 6520,
+        "Gas Price (Gwei)": 45,
+        "Token Holders": 40000,
+    }
+
+# --------------------------
+# Market-Making & Arbitrage Bot Simulator (Concept)
+# --------------------------
+
+def simulate_market_making(orderbook_bid, orderbook_ask, spread_threshold=0.1):
+    profits = 0
+    trades = []
+    if not orderbook_bid or not orderbook_ask:
+        return 0, []
+    for bid_price, bid_qty in orderbook_bid:
+        bid_price = float(bid_price)
+        bid_qty = float(bid_qty)
+        for ask_price, ask_qty in orderbook_ask:
+            ask_price = float(ask_price)
+            ask_qty = float(ask_qty)
+            spread = (ask_price - bid_price) / bid_price * 100
+            if spread > spread_threshold:
+                trade_qty = min(bid_qty, ask_qty)
+                profit = trade_qty * spread / 100 * bid_price
+                trades.append((bid_price, ask_price, trade_qty, profit))
+                profits += profit
+    return profits, trades
+
+# --------------------------
+# Custom Chart Generator
+# --------------------------
+
+if 'chart_counter' not in st.session_state:
+    st.session_state.chart_counter = 0
+
+def render_chartjs(config):
+    """Render an interactive chart using Chart.js within Streamlit."""
+    chart_id = f"chart{st.session_state.chart_counter}"
+    st.session_state.chart_counter += 1
+    html_code = f"""
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <canvas id="{chart_id}" width="400" height="400"></canvas>
+    <script>
+    var ctx = document.getElementById('{chart_id}').getContext('2d');
+    var chartConfig = {json.dumps(config)};
+    new Chart(ctx, chartConfig);
+    </script>
+    """
+    st.components.v1.html(html_code, height=450)
+
+def widget_custom_charts():
+    st.subheader("Custom Chart Generator")
+    # Data source options based on available dashboard data
+    data_sources = {
+        "Historical Prices": lambda: (
+            df_live["close_time"].dt.strftime("%Y-%m-%d %H:%M").tolist(),
+            df_live["close"].tolist()
+        ) if df_live is not None else (None, None),
+        "Sentiment Scores": lambda: (
+            ["Positive", "Negative", "Neutral"],
+            [analyze_sentiment(st.session_state.crypto)[key] for key in ["positive", "negative", "neutral"]]
+        ),
+        "Portfolio Allocations": lambda: (
+            list(asyncio.run(calculate_portfolio_value())[1].keys()),
+            list(asyncio.run(calculate_portfolio_value())[1].values())
+        ),
+    }
+    selected_data_source = st.selectbox("Select Data Source", list(data_sources.keys()))
+    chart_types = ['bar', 'line', 'pie', 'doughnut', 'radar', 'polarArea']
+    selected_chart_type = st.selectbox("Select Chart Type", chart_types)
+
+    if st.button("Generate Chart"):
+        labels, data = data_sources[selected_data_source]()
+        if labels is None or data is None:
+            st.error("Data not available for the selected source.")
+            return
+
+        # Define chart configuration
+        config = {
+            "type": selected_chart_type,
+            "data": {
+                "labels": labels,
+                "datasets": [{
+                    "label": selected_data_source,
+                    "data": data,
+                    "backgroundColor": ["#FF6384", "#36A2EB", "#FFCE56", "#4BC0C0", "#9966FF", "#FF9F40"],
+                    "borderColor": "#fff",
+                    "borderWidth": 1
+                }]
+            },
+            "options": {
+                "responsive": True,
+                "maintainAspectRatio": False,
+                "plugins": {
+                    "legend": {"position": "top"},
+                    "title": {"display": True, "text": selected_data_source}
+                }
+            }
+        }
+
+        # Adjust scales for applicable chart types
+        if selected_chart_type in ['line', 'bar']:
+            config["options"]["scales"] = {
+                "x": {"title": {"display": True, "text": "Time" if selected_data_source == "Historical Prices" else "Category"}},
+                "y": {"title": {"display": True, "text": "Value"}, "beginAtZero": True}
+            }
+
+        st.write("Here is your custom chart:")
+        render_chartjs(config)
+
+# --------------------------
+# Customizable Dashboard & Widgets
+# --------------------------
+
+def widget_market_overview():
+    st.subheader("Market Overview")
+    current_datetime = datetime.now().strftime("%I:%M %p IST, %B %d, %Y")
+    market_status = get_market_status()
+    st.write(f"Status at {current_datetime}: {market_status['status']} (Volatility: {market_status['volatility']*100:.2f}%)")
+    if current_price is not None:
+        st.metric("Current Price (USDT)", f"{current_price:.2f}")
+        if df_live is not None and len(df_live) > 1:
+            st.metric("24h Change", f"{((current_price - df_live['close'].iloc[-2]) / df_live['close'].iloc[-2] * 100):.2f}%")
+        else:
+            st.metric("24h Change", "N/A")
+    if df_live is not None and len(df_live) > 0:
+        st.dataframe(df_live[["close_time", "open", "high", "low", "close", "volume"]].tail(10))
+        st.line_chart(df_live["close"].tail(50))
+    else:
+        st.info("Price data not available.")
+    with st.expander("Market News"):
+        st.write("Simulated News: Positive market sentiment due to upcoming ICO launches.")
+
+def widget_price_chart():
+    st.subheader("Price Chart (Realtime)")
+    st.subheader("Chart Settings")
+    chart_theme = st.selectbox("Chart Theme", ["plotly", "plotly_dark", "plotly_white"], help="Choose chart theme")
+    sma_length = st.number_input("SMA Length", min_value=1, max_value=200, value=14, help="Simple Moving Average period")
+    rsi_length = st.number_input("RSI Length", min_value=1, max_value=200, value=14, help="Relative Strength Index period")
+    macd_fast = st.number_input("MACD Fast", min_value=1, max_value=100, value=12, help="MACD fast EMA period")
+    macd_slow = st.number_input("MACD Slow", min_value=1, max_value=200, value=26, help="MACD slow EMA period")
+    macd_signal = st.number_input("MACD Signal", min_value=1, max_value=100, value=9, help="MACD signal line period")
+    zoom_level = st.slider("Zoom Level (Days)", 1, 30, 7, help="Adjust chart zoom")
+
+    if sma_length <= 0 or rsi_length <= 0 or macd_fast <= 0 or macd_slow <= 0 or macd_signal <= 0:
+        st.error("Indicator periods must be positive.")
+        return
+    elif df_live is not None and len(df_live) > 0:
+        with st.spinner("Generating chart..."):
+            fig = calculate_indicators(df_live, sma_length, rsi_length, macd_fast, macd_slow, macd_signal, chart_theme)
+            st.plotly_chart(fig, use_container_width=True)
+            st.download_button("Download Chart Data", df_live.to_csv(), f"{st.session_state.crypto}_chart_data.csv", "text/csv")
+            with st.expander("Toggle Fibonacci Retracement"):
+                if st.checkbox("Show Fibonacci Retracement", value=False):
+                    plot_with_fibonacci(df_live)
+    else:
+        st.info("Price chart not available due to data fetching issues.")
+
+    st.subheader("Set Alerts")
+    alert_type = st.selectbox("Alert Type", ["Price", "RSI", "MACD Crossover"], help="Choose alert type")
+    threshold = st.number_input("Threshold", value=0.0, help="Set alert threshold")
+    if alert_type == "Price" and current_price is not None and current_price > threshold:
+        st.warning(f"Alert: {st.session_state.crypto} price {current_price:.2f} exceeded {threshold}!")
+    elif alert_type == "RSI" and df_live is not None:
+        rsi = calculate_rsi_fallback(df_live, rsi_length) if ta is None else ta.rsi(df_live["close"], length=rsi_length)
+        if not rsi.isna().all() and rsi.iloc[-1] > threshold:
+            st.warning(f"Alert: {st.session_state.crypto} RSI {rsi.iloc[-1]:.2f} exceeded {threshold}!")
+    elif alert_type == "MACD Crossover" and df_live is not None:
+        macd_info = calculate_macd(df_live, macd_fast, macd_slow, macd_signal)
+        if "Bullish" in macd_info and threshold == 1:
+            st.success(f"Alert: Bullish MACD crossover detected!")
+        elif "Bearish" in macd_info and threshold == -1:
+            st.warning(f"Alert: Bearish MACD crossover detected!")
+
+def widget_sentiment_analysis():
+    st.subheader("Real-Time Sentiment Analysis")
+    sentiment_scores = analyze_sentiment(st.session_state.crypto)
+    st.write(f"Compound Sentiment: {sentiment_scores['compound']:.2f} (Range: -1 to 1)")
+    st.write(f"Positive: {sentiment_scores['positive']:.2f}, Negative: {sentiment_scores['negative']:.2f}, Neutral: {sentiment_scores['neutral']:.2f}")
+    sentiment_trend = st.selectbox("View Sentiment Trend", ["Last 24h", "Last Week", "Custom"])
+    if sentiment_trend == "Custom":
+        start_date = st.date_input("Start Date")
+        end_date = st.date_input("End Date")
+        if start_date > end_date:
+            st.error("Start date must be before end date.")
+        else:
+            trend_data = pd.DataFrame({
+                "time": pd.date_range(start=start_date, end=end_date, freq="D"),
+                "sentiment": np.random.uniform(-0.5, 0.5, len(pd.date_range(start=start_date, end=end_date, freq="D")))
+            })
+            st.line_chart(trend_data.set_index("time")["sentiment"])
+    with st.expander("Sentiment Breakdown"):
+        st.bar_chart({
+            "Positive": sentiment_scores["positive"],
+            "Negative": sentiment_scores["negative"],
+            "Neutral": sentiment_scores["neutral"]
+        })
+
+def widget_portfolio_management():
+    st.subheader("Portfolio Management")
+    total_value, allocations = asyncio.run(calculate_portfolio_value())
+    st.write(f"Total Portfolio Value: ${total_value:.2f}")
+    if allocations:
+        st.bar_chart(allocations)
+    amount = st.number_input("Amount to Add", min_value=0.0, value=1.0, step=0.1, help="Amount to add to portfolio")
+    if st.button("Update Portfolio"):
+        updated = update_portfolio(st.session_state.crypto, amount)
+        st.write(f"Portfolio updated! Current holdings: {updated}")
+
+    if st.button("Export Portfolio"):
+        portfolio_df = pd.DataFrame(st.session_state.portfolio.items(), columns=["Crypto", "Amount"])
+        csv = portfolio_df.to_csv(index=False)
+        st.download_button("Download Portfolio CSV", csv, "portfolio.csv", "text/csv")
+
+    st.subheader("Portfolio Optimization")
+    target_return = st.slider("Target Annual Return (%)", 0.0, 50.0, 10.0, 0.5) / 100
+    if st.button("Optimize Portfolio"):
+        with st.spinner("Optimizing portfolio..."):
+            df_dict = asyncio.run(fetch_all_historical_data(CONFIG["supported_cryptos"], interval="1d", limit=30))
+            df_dict = {k: v for k, v in df_dict.items() if v is not None}
+            if df_dict:
+                weights, assets = get_optimal_weights(df_dict, target_return)
+                st.write(f"Optimal Weights: {', '.join([f'{a}: {w:.2%}' for a, w in zip(assets, weights)])}")
+            else:
+                st.write("Insufficient data for optimization.")
+    with st.expander("Transaction History"):
+        if 'transaction_history' in st.session_state:
+            st.table(pd.DataFrame(st.session_state.transaction_history))
+
+def widget_backtesting():
+    st.subheader("Price Prediction and Strategy Tester")
+    if st.button("Predict Price"):
+        with st.spinner("Calculating prediction..."):
+            if df_live is not None and len(df_live) > 0:
+                sentiment_scores = analyze_sentiment(st.session_state.crypto)
+                indicators = {"SMA": df_live["SMA"].iloc[-1] if "SMA" in df_live else df_live["close"].iloc[-1]}
+                prediction, conf_interval, model, X, y = predict_price(df_live, sentiment_scores["compound"], indicators)
+                st.write(f"Predicted Price: ${prediction:.2f} ± ${conf_interval:.2f} (95% CI)")
+                plot_feature_importance(model, X, y)
+            else:
+                st.write("Insufficient data for prediction.")
+
+    st.subheader("Backtesting Range")
+    start_date = st.date_input("Start Date", help="Select backtest start date")
+    end_date = st.date_input("End Date", help="Select backtest end date")
+    strategy_file = st.file_uploader("Upload Strategy File", type=["py"], help="Upload a Python strategy file")
+    initial_capital = st.number_input("Initial Capital (USD)", min_value=100.0, value=1000.0, step=100.0)
+    if st.button("Backtest Strategy"):
+        with st.spinner("Running backtest..."):
+            if strategy_file and df_live is not None:
+                result = backtest_strategy(strategy_file, df_live, start_date, end_date)
+                if isinstance(result, dict):
+                    st.write(result["result"])
+                    st.plotly_chart(result["fig"], use_container_width=True)
+                    if hasattr(result["fig"], "data") and len(result["fig"].data) > 0:
+                        last_equity = result["fig"].data[0].y[-1] if len(result["fig"].data[0].y) > 0 else 1.0
+                        st.write(f"Final Equity with ${initial_capital:.2f}: ${(initial_capital * last_equity):.2f}")
+                else:
+                    st.write(result)
+            else:
+                st.write("Please upload a strategy file and ensure price data is available.")
+
+def widget_risk_management():
+    st.subheader("Advanced Risk Management")
+    if df_live is not None and len(df_live) > 0:
+        var = calculate_var(df_live)
+        returns = df_live["close"].pct_change().dropna()
+        sharpe, sortino = calculate_sharpe_ratio(returns)
+        st.write(f"Value at Risk (VaR) at 95%: ${var:.2f}")
+        st.write(f"Sharpe Ratio: {sharpe:.2f}, Sortino Ratio: {sortino:.2f}")
+        st.line_chart(returns.tail(50))
+        with st.expander("Risk Scenarios"):
+            confidence = st.slider("Confidence Level (%)", 90.0, 99.0, 95.0, 0.5)
+            var_custom = calculate_var(df_live, confidence / 100)
+            st.write(f"VaR at {confidence}%: ${var_custom:.2f}")
+    else:
+        st.write("Not enough data for risk metrics.")
+
+def widget_additional_data():
+    st.subheader("DEX Data")
+    dex_data = fetch_dex_data(st.session_state.crypto)
+    st.write(dex_data)
+    try:
+        liquidity_val = float(dex_data["liquidity"].split("$")[1].replace("M", "000000"))
+        volume_val = float(dex_data["volume_24h"].split("$")[1].replace("K", "000"))
+    except Exception:
+        liquidity_val = 0.0
+        volume_val = 0.0
+    st.bar_chart({"Liquidity": liquidity_val,
+                  "Volume (24h)": volume_val})
+
+    st.subheader("Wallet Balance")
+    wallet_data = fetch_wallet_balance(st.session_state.crypto)
+    st.write(wallet_data)
+    try:
+        usd_val = float(wallet_data["usd_value"].split("$")[1])
+        st.progress(min(1.0, usd_val / 50000))
+    except Exception:
+        st.progress(0.0)
+
+    st.subheader("Upcoming ICOs/Tokens")
+    ico_list = fetch_ico_data()
+    for ico in ico_list:
+        st.write(f"{ico['name']}: {ico['date']} (Raised: {ico['raised']})")
+        if st.button(f"Details for {ico['name']}", key=ico['name']):
+            st.write(f"More details about {ico['name']} to be added...")
+
+    st.subheader("Arbitrage Opportunities")
+    exchange_prices = fetch_exchange_prices(st.session_state.crypto)
+    prices = exchange_prices.get(f"{st.session_state.crypto}USDT", {})
+    max_price = max(prices.values()) if prices else 0
+    min_price = min(prices.values()) if prices else 0
+    if max_price > min_price > 0:
+        max_ex = max(prices, key=prices.get)
+        min_ex = min(prices, key=prices.get)
+        st.write(f"Buy at {min_ex} (${min_price:.2f}), Sell at {max_ex} (${max_price:.2f}), Spread: {(max_price - min_price) / min_price:.2%}")
+        st.bar_chart(prices)
+    else:
+        st.write("No arbitrage opportunities detected.")
+    st.write(exchange_prices)
+
+    st.subheader("Transaction Monitoring")
+    tx_data = fetch_transaction_data(st.session_state.crypto)
+    st.write(tx_data)
+    st.line_chart({"Transaction Volume": [tx_data["volume"]] * 10})
+
+def widget_custom_indicators():
+    st.subheader("Custom Indicators")
+    plugin_names = ["calculate_rsi", "calculate_macd", "calculate_bollinger_bands"]
+    selected_plugin = st.selectbox("Select Plugin", plugin_names, help="Select an indicator plugin")
+    if selected_plugin:
+        func = globals().get(selected_plugin)
+        if callable(func) and df_live is not None and len(df_live) > 0:
+            if selected_plugin == "calculate_rsi":
+                st.write(func(df_live, length=14))
+            elif selected_plugin == "calculate_macd":
+                st.write(func(df_live, fast=12, slow=26, signal=9))
+            elif selected_plugin == "calculate_bollinger_bands":
+                if ta is not None:
+                    bbands = ta.bbands(df_live["close"], length=20, std=2)
+                    st.write(f"Bollinger Bands: Upper {bbands['BBU_20_2.0'].iloc[-1]:.2f}, Lower {bbands['BBL_20_2.0'].iloc[-1]:.2f}")
+                    st.line_chart(pd.DataFrame({
+                        "Upper": bbands["BBU_20_2.0"],
+                        "Lower": bbands["BBL_20_2.0"],
+                        "Close": df_live["close"]
+                    }).tail(50))
+                else:
+                    st.write("Bollinger Bands require pandas_ta.")
+        else:
+            st.write(f"{selected_plugin} not available or data not ready.")
+    with st.expander("Create Custom Indicator"):
+        code = st.text_area("Enter Custom Indicator Code", height=200)
+        if st.button("Run Custom Indicator"):
+            try:
+                local_env = {}
+                exec(code, {"df": df_live, "ta": ta, "np": np, "pd": pd}, local_env)
+                result = local_env.get("custom_indicator")
+                if result is not None:
+                    st.write(f"Custom Indicator Result: {result}")
+                else:
+                    st.write("No 'custom_indicator' variable returned.")
+            except Exception as e:
+                st.error(f"Error running custom indicator: {e}")
+
+# ---- UI with improved visuals ----
+
+# Custom CSS for theme, fonts, colors
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600&display=swap');
+    html, body, [class*="css"]  {
+        font-family: 'Montserrat', sans-serif;
+        background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+        color: #e0e6e9;
+    }
+    .stButton>button {
+        background-color: #0A84FF;
+        color: white;
+        border-radius: 8px;
+        padding: 8px 20px;
+        font-weight: 600;
+        transition: background-color 0.3s ease;
+    }
+    .stButton>button:hover {
+        background-color: #006be6;
+    }
+    .css-1d391kg {
+        background-color: #142b43 !important;
+        border-radius: 10px;
+        padding: 15px;
+        margin-bottom: 20px;
+        box-shadow: 0 5px 15px rgba(10, 132, 255, 0.4);
+    }
+    .stMetricValue {
+        font-size: 1.8rem !important;
+        font-weight: 700;
+        color: #34c759 !important;
+    }
+    .stMetricDelta {
+        font-size: 1.2rem !important;
+        font-weight: 600;
+    }
+    .stDataFrame table {
+        border-collapse: collapse;
+        border-radius: 6px;
+        overflow: hidden;
+        box-shadow: 0 2px 12px rgb(0 0 0 / 0.2);
+    }
+    .stDataFrame thead tr th {
+        background-color: #0a84ff;
+        color: white;
+        padding: 8px 12px;
+        text-align: center;
+    }
+    .stDataFrame tbody tr:nth-child(even) {
+        background-color: #1c2833;
+    }
+    .stDataFrame tbody tr:hover {
+        background-color: #274a7d;
+        color: #ffffff;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Page header with icon and subtitle
+st.markdown(
+    """
+    <div style="text-align:center; margin-bottom:20px;">
+        <h1 style="color:#0A84FF; font-weight:700;">🚀 Enhanced Crypto Dashboard</h1>
+        <p style="font-size:18px; color:#d0d7de; font-style:italic;">Real-time crypto insights, predictions, sentiment, portfolio & more.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Sidebar improvements with emojis and spacing
+with st.sidebar:
+    st.markdown("## 🎛️ Settings")
+    crypto = st.selectbox(
+        "Select Cryptocurrency 🪙",
+        CONFIG["supported_cryptos"],
+        index=CONFIG["supported_cryptos"].index(st.session_state.get("crypto", "BTC")),
+        key="crypto_select",
+        help="Choose a cryptocurrency to analyze"
+    )
+    st.session_state.crypto = crypto
+
+    timeframe = st.selectbox(
+        "Select Timeframe ⏱️",
+        CONFIG["valid_timeframes"],
+        index=CONFIG["valid_timeframes"].index(st.session_state.get("timeframe", CONFIG["default_interval"])),
+        help="Choose chart timeframe"
+    )
+    if timeframe != st.session_state.get("timeframe", CONFIG["default_interval"]):
+        if timeframe in CONFIG["valid_timeframes"]:
+            st.session_state.timeframe = timeframe
+            start_ws(crypto)
+        else:
+            st.error("Invalid timeframe selected.")
+
+    layout = st.selectbox("Select Layout 🖥️", ["Default", "Compact", "Detailed", "Full-Screen"], help="Choose dashboard layout")
+    high_contrast = st.checkbox("Enable High-Contrast Mode", help="Improves visibility for visual impairments")
+    notifications = st.checkbox("Enable Notifications 🔔", help="Get real-time alerts")
+
+    st.markdown("---")
+    st.markdown("## 🧭 Navigation")
+    tab = st.radio(
+        "Select Tab",
+        ["Market Overview", "Price Chart", "Sentiment Analysis", "Portfolio Management", "Backtesting", "Risk Management", 
+         "Additional Data", "Custom Indicators", "Depth Chart Visualization", "Advanced Portfolio Analytics", "On-Chain Data", 
+         "Market-Making & Arbitrage Simulator", "Custom Charts"],
+        help="Choose a section to view",
+        horizontal=False,
+    )
+
+if high_contrast:
+    st.markdown("""
+    <style>
+    body { background-color: #000 !important; color: #fff !important; }
+    .stButton>button { background-color: #fff !important; color: #000 !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+layout_msgs = {
+    "Compact": "✨ Compact layout enabled for fast navigation.",
+    "Detailed": "📊 Detailed layout with all info expanded.",
+    "Full-Screen": "🖥️ Full-screen layout maximizing charts and data."
+}
+if layout in layout_msgs:
+    st.info(layout_msgs[layout])
+
+current_time = time.time()
+if current_time - st.session_state.last_update > 1:
+    st.session_state.last_update = current_time
+    symbol = st.session_state.crypto + "USDT"
+    try:
+        with st.spinner(f"⏳ Fetching historical data for {st.session_state.crypto}..."):
+            df_klines = asyncio.run(fetch_historical_klines_async(symbol, interval=st.session_state.timeframe, limit=CONFIG["default_limit"]))
+    except Exception as e:
+        st.error(f"Error fetching historical data: {e}")
+        df_klines = None
+
+    start_ws(st.session_state.crypto)
+    df_live = get_updated_df(df_klines)
+
+    if st.session_state.ws_errors:
+        st.warning(f"⚠️ WebSocket issues: {st.session_state.ws_errors[-1]}")
+
+    current_price = None
+    if st.session_state.ws_data:
+        current_price = st.session_state.ws_data["close"]
+    elif df_klines is not None and not df_klines.empty:
+        current_price = df_klines["close"].iloc[-1]
+
+with st.container():
+    st.markdown("<hr style='border-top:1px solid #0A84FF;'>", unsafe_allow_html=True)
+    if tab == "Market Overview":
+        st.header("📈 Market Overview")
+        cols = st.columns([1, 2])
+        with cols[0]:
+            if current_price is not None:
+                st.metric(label=f"Current Price ({st.session_state.crypto}/USDT) 💰", value=f"${current_price:.2f}", delta=None)
+                if df_live is not None and len(df_live) > 1:
+                    change = (current_price - df_live['close'].iloc[-2]) / df_live['close'].iloc[-2] * 100
+                    st.metric(label="24h Change 📊", value=f"{change:.2f} %", delta=f"{change:.2f}%")
+        with cols[1]:
+            if df_live is not None and len(df_live) > 0:
+                st.line_chart(df_live["close"].tail(100))
+            else:
+                st.info("Price data not available.")
+        with st.expander("Latest Market News 📰"):
+            st.write("Simulated News: Positive market sentiment due to upcoming ICO launches.")
+    elif tab == "Price Chart":
+        st.header(f"📉 Price Chart - {st.session_state.crypto}")
+        widget_price_chart()
+    elif tab == "Sentiment Analysis":
+        st.header(f"🗣️ Sentiment Analysis - {st.session_state.crypto}")
+        widget_sentiment_analysis()
+    elif tab == "Portfolio Management":
+        st.header("💼 Portfolio Management")
+        widget_portfolio_management()
+    elif tab == "Backtesting":
+        st.header("⏳ Price Prediction & Strategy Backtesting")
+        widget_backtesting()
+    elif tab == "Risk Management":
+        st.header("⚖️ Advanced Risk Management")
+        widget_risk_management()
+    elif tab == "Additional Data":
+        st.header("🔍 Additional Crypto Data & Stats")
+        widget_additional_data()
+    elif tab == "Custom Indicators":
+        st.header("⚙️ Custom Indicator Plugins")
+        widget_custom_indicators()
+    elif tab == "Depth Chart Visualization":
+        st.header("📊 Order Book Depth Chart")
+        obs = fetch_order_book(symbol)
+        plot_depth_chart(obs)
+    elif tab == "Advanced Portfolio Analytics":
+        st.header("📊 Advanced Portfolio Analytics")
+        df_daily = asyncio.run(fetch_all_historical_data(CONFIG["supported_cryptos"], interval='1d', limit=365))
+        plot_portfolio_analytics(df_daily)
+    elif tab == "On-Chain Data":
+        st.header(f"⛓️ On-Chain Data for {st.session_state.crypto}")
+        metrics = fetch_onchain_metrics(st.session_state.crypto)
+        for k, v in metrics.items():
+            st.metric(k, v)
+    elif tab == "Market-Making & Arbitrage Simulator":
+        st.header("🤖 Market-Making & Arbitrage Simulator")
+        obs = fetch_order_book(symbol)
+        total_profit, trades = simulate_market_making(obs.get("bids", []), obs.get("asks", []), spread_threshold=0.1)
+        st.write(f"Simulated Total Profit: 💵 ${total_profit:.2f}")
+        st.write(f"Simulated Trades (limited 10):")
+        for trade in trades[:10]:
+            st.write(f"Buy at {trade[0]:.2f}, Sell at {trade[1]:.2f}, Qty: {trade[2]:.4f}, Profit: ${trade[3]:.2f}")
+    elif tab == "Custom Charts":
+        st.header("🎨 Custom Chart Generator")
+        widget_custom_charts()
+
+st.markdown(
+    """
+    <footer style="text-align:center; padding-top:15px; font-size:12px; color:#666;">
+    ⚡ Built with ❤️ by YourName - Enhanced Crypto Dashboard ⚡
+    </footer>
+    """,
+    unsafe_allow_html=True,
+)
