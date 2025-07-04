@@ -14,7 +14,8 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.inspection import permutation_importance
 from scipy.optimize import minimize
 from datetime import datetime
-from websocket import create_connection, WebSocketConnectionClosedException
+from websocket._core import create_connection
+from websocket._exceptions import WebSocketConnectionClosedException
 import os
 import logging
 from cryptography.fernet import Fernet
