@@ -152,30 +152,47 @@ async def fetch_historical_klines_async(symbol: str, interval: str = "1m", limit
             }
             
             if crypto_symbol in coingecko_map:
-                # Get basic historical data from CoinGecko (limited but free)
-                url = f"https://api.coingecko.com/api/v3/coins/{coingecko_map[crypto_symbol]}/market_chart?vs_currency=usd&days=1&interval=hourly"
+                # Determine days based on interval and limit
+                interval_days = {
+                    "1m": 1, "3m": 1, "5m": 1, "15m": 1, "30m": 1,
+                    "1h": 2, "2h": 4, "4h": 7, "6h": 14, "8h": 21, "12h": 30,
+                    "1d": min(limit, 365), "3d": min(limit * 3, 365), 
+                    "1w": min(limit * 7, 365), "1M": min(limit * 30, 365)
+                }
+                days = interval_days.get(interval, 7)
+                
+                # Get historical data from CoinGecko
+                url = f"https://api.coingecko.com/api/v3/coins/{coingecko_map[crypto_symbol]}/market_chart?vs_currency=usd&days={days}"
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        prices = data["prices"]
-                        volumes = data["total_volumes"]
-                        
-                        # Create a simplified DataFrame with available data
-                        df_data = []
-                        for i, (price_data, volume_data) in enumerate(zip(prices[-limit:], volumes[-limit:])):
-                            timestamp, price = price_data
-                            _, volume = volume_data
-                            df_data.append({
-                                "open_time": pd.to_datetime(timestamp, unit="ms"),
-                                "close_time": pd.to_datetime(timestamp, unit="ms"),
-                                "open": price,
-                                "high": price,  # Only actual price available from this API
-                                "low": price,   # Only actual price available from this API
-                                "close": price,
-                                "volume": volume
-                            })
-                        
-                        return pd.DataFrame(df_data)
+                        if "prices" in data and len(data["prices"]) > 0:
+                            prices = data["prices"]
+                            volumes = data.get("total_volumes", [])
+                            
+                            # Sample data points based on limit
+                            step = max(1, len(prices) // limit) if limit < len(prices) else 1
+                            sampled_prices = prices[::step][-limit:]
+                            sampled_volumes = volumes[::step][-limit:] if volumes else []
+                            
+                            # Create DataFrame with available data
+                            df_data = []
+                            for i, price_data in enumerate(sampled_prices):
+                                timestamp, price = price_data
+                                volume = sampled_volumes[i][1] if i < len(sampled_volumes) else 0
+                                
+                                df_data.append({
+                                    "open_time": pd.to_datetime(timestamp, unit="ms"),
+                                    "close_time": pd.to_datetime(timestamp, unit="ms"),
+                                    "open": price,
+                                    "high": price,  # Single price point from CoinGecko
+                                    "low": price,   # Single price point from CoinGecko  
+                                    "close": price,
+                                    "volume": volume
+                                })
+                            
+                            if df_data:
+                                return pd.DataFrame(df_data)
         except Exception as e:
             logger.warning(f"CoinGecko historical data failed: {e}")
         
