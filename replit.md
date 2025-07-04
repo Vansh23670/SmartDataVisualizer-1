@@ -98,6 +98,12 @@ This is a Streamlit-based cryptocurrency trading dashboard that provides real-ti
   - Added database analytics section showing price history and API reliability
   - Updated data storage from encrypted JSON files to PostgreSQL database
   - Implemented automatic price and sentiment data logging to database
+- July 04, 2025: Enhanced historical data fetching and UI improvements
+  - Fixed CoinGecko API integration for reliable historical price data
+  - Improved data sampling and timeframe handling for charts
+  - Enhanced error messaging for optional features (blockchain, sentiment analysis)
+  - Cleaned up status messages and removed unnecessary warnings
+  - Maintained authentic data integrity throughout all features
 
 ## Changelog
 
