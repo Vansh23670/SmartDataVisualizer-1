@@ -24,6 +24,9 @@ import nest_asyncio
 from functools import wraps
 from plotly.subplots import make_subplots
 
+# Database integration
+from db_service import db_service
+
 # External library for sortable widgets
 try:
     from streamlit_sortables import sortables
@@ -105,21 +108,26 @@ if 'crypto' not in st.session_state:
 PORTFOLIO_FILE = "portfolio.json"
 
 def save_portfolio() -> None:
-    encrypted_data = cipher.encrypt(json.dumps(st.session_state.portfolio).encode())
-    with open(PORTFOLIO_FILE, 'wb') as f:
-        f.write(encrypted_data)
+    """Save portfolio to database"""
+    try:
+        for crypto_symbol, amount in st.session_state.portfolio.items():
+            if amount != 0:  # Only save non-zero holdings
+                db_service.update_portfolio(crypto_symbol, amount)
+    except Exception as e:
+        st.error(f"Failed to save portfolio to database: {e}")
 
 def load_portfolio() -> None:
-    if os.path.exists(PORTFOLIO_FILE):
-        try:
-            with open(PORTFOLIO_FILE, 'rb') as f:
-                encrypted_data = f.read()
-            decrypted_data = cipher.decrypt(encrypted_data).decode()
-            st.session_state.portfolio = json.loads(decrypted_data)
-        except Exception as e:
-            st.error(f"Failed to load portfolio: {e}")
-            st.session_state.portfolio = {crypto: 0 for crypto in CONFIG["supported_cryptos"]}
-    else:
+    """Load portfolio from database"""
+    try:
+        db_portfolio = db_service.get_portfolio()
+        # Initialize with supported cryptos
+        st.session_state.portfolio = {crypto: 0 for crypto in CONFIG["supported_cryptos"]}
+        # Update with database values
+        for crypto_symbol, data in db_portfolio.items():
+            if crypto_symbol in st.session_state.portfolio:
+                st.session_state.portfolio[crypto_symbol] = data.get("amount", 0)
+    except Exception as e:
+        st.error(f"Failed to load portfolio from database: {e}")
         st.session_state.portfolio = {crypto: 0 for crypto in CONFIG["supported_cryptos"]}
 
 load_portfolio()
@@ -206,6 +214,11 @@ async def fetch_current_price_async(symbol: str) -> float:
                         data = await resp.json()
                         price = float(data[coingecko_map[crypto_symbol]]["usd"])
                         price_cache[cache_key] = {"price": price, "timestamp": time.time()}
+                        # Save price to database
+                        try:
+                            db_service.save_crypto_price(symbol, price, source="coingecko")
+                        except Exception:
+                            pass  # Don't fail if database save fails
                         return price
         except Exception as e:
             logger.warning(f"CoinGecko API failed: {e}")
@@ -929,6 +942,80 @@ def main():
         
         with sent_col4:
             st.metric("Neutral", f"{sentiment_data['neutral']:.2f}")
+        
+        # Save sentiment to database
+        try:
+            db_service.save_sentiment_data(
+                crypto, 
+                sentiment_data['compound'],
+                sentiment_data['positive'],
+                sentiment_data['negative'],
+                sentiment_data['neutral']
+            )
+        except Exception:
+            pass  # Don't fail if database save fails
+    
+    # Database Analytics
+    st.subheader("🗄️ Database Analytics")
+    
+    analytics_col1, analytics_col2 = st.columns(2)
+    
+    with analytics_col1:
+        st.write("**Price Analytics (30 days)**")
+        try:
+            price_analytics = db_service.get_price_analytics(f"{crypto}USDT", days=30)
+            if price_analytics:
+                st.write(f"• Min Price: ${price_analytics['min_price']:.2f}")
+                st.write(f"• Max Price: ${price_analytics['max_price']:.2f}")
+                st.write(f"• Avg Price: ${price_analytics['avg_price']:.2f}")
+                st.write(f"• Change: {price_analytics['price_change_percent']:.2f}%")
+                st.write(f"• Data Points: {price_analytics['data_points']}")
+            else:
+                st.info("No historical price data in database yet")
+        except Exception as e:
+            st.error(f"Failed to load price analytics: {e}")
+    
+    with analytics_col2:
+        st.write("**API Reliability (24h)**")
+        try:
+            api_stats = db_service.get_api_reliability(hours=24)
+            if api_stats:
+                for api_name, stats in api_stats.items():
+                    success_rate = stats['success_rate'] * 100
+                    st.write(f"• {api_name.title()}: {success_rate:.1f}% success rate")
+                    st.write(f"  └ Avg Response: {stats['avg_response_time']:.2f}s")
+            else:
+                st.info("No API statistics available yet")
+        except Exception as e:
+            st.error(f"Failed to load API stats: {e}")
+    
+    # Historical price chart from database
+    if st.checkbox("Show Database Price History"):
+        try:
+            db_history = db_service.get_price_history(f"{crypto}USDT", hours=168)  # 7 days
+            if db_history:
+                db_df = pd.DataFrame(db_history)
+                db_df['timestamp'] = pd.to_datetime(db_df['timestamp'])
+                
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=db_df['timestamp'],
+                    y=db_df['price'],
+                    mode='lines',
+                    name=f'{crypto} Price History (Database)',
+                    line=dict(color='#1f77b4')
+                ))
+                fig.update_layout(
+                    title=f'{crypto} Price History from Database',
+                    xaxis_title='Time',
+                    yaxis_title='Price (USD)',
+                    height=400
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No historical price data in database")
+        except Exception as e:
+            st.error(f"Failed to load database history: {e}")
     
     # Additional Data Sections
     st.subheader("📊 Additional Market Data")

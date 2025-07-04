@@ -89,9 +89,20 @@ This is a Streamlit-based cryptocurrency trading dashboard that provides real-ti
 - **Security**: Encrypted sensitive data storage
 - **Monitoring**: Application logging for debugging and monitoring
 
+## Recent Changes
+
+- July 04, 2025: Initial crypto dashboard setup with Streamlit
+- July 04, 2025: Added PostgreSQL database integration with comprehensive models
+  - Created database models for crypto prices, portfolio, trading signals, sentiment data, and API status
+  - Integrated database service with existing portfolio management
+  - Added database analytics section showing price history and API reliability
+  - Updated data storage from encrypted JSON files to PostgreSQL database
+  - Implemented automatic price and sentiment data logging to database
+
 ## Changelog
 
-- July 04, 2025. Initial setup
+- July 04, 2025: Initial setup with Streamlit crypto dashboard
+- July 04, 2025: Integrated PostgreSQL database for persistent data storage
 
 ## User Preferences
 
